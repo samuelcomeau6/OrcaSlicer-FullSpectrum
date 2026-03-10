@@ -27,6 +27,8 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <iterator>
 #include <exception>
 #include <cstdlib>
@@ -178,6 +180,71 @@ namespace Slic3r {
 namespace GUI {
 
 class MainFrame;
+
+namespace {
+
+bool startup_profile_enabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("ORCA_STARTUP_PROFILE");
+        if (value == nullptr)
+            return false;
+
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+    }();
+    return enabled;
+}
+
+class StartupProfiler
+{
+public:
+    explicit StartupProfiler(const char* phase)
+        : m_phase(phase)
+        , m_enabled(startup_profile_enabled())
+        , m_phase_start(std::chrono::steady_clock::now())
+        , m_step_start(m_phase_start)
+    {
+        if (m_enabled)
+            BOOST_LOG_TRIVIAL(warning) << "[StartupProfile] phase=" << m_phase << " begin";
+    }
+
+    bool enabled() const { return m_enabled; }
+
+    void mark(const char* step)
+    {
+        if (!m_enabled)
+            return;
+        const auto now      = std::chrono::steady_clock::now();
+        const auto step_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_step_start).count();
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_phase_start).count();
+        BOOST_LOG_TRIVIAL(warning) << "[StartupProfile] phase=" << m_phase << " step=" << step << " step_ms=" << step_ms << " total_ms=" << total_ms;
+        m_step_start = now;
+    }
+
+    void note(const std::string& message) const
+    {
+        if (m_enabled)
+            BOOST_LOG_TRIVIAL(warning) << "[StartupProfile] phase=" << m_phase << " " << message;
+    }
+
+    ~StartupProfiler()
+    {
+        if (!m_enabled)
+            return;
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_phase_start).count();
+        BOOST_LOG_TRIVIAL(warning) << "[StartupProfile] phase=" << m_phase << " end total_ms=" << total_ms;
+    }
+
+private:
+    const char*                                m_phase;
+    bool                                       m_enabled;
+    std::chrono::steady_clock::time_point      m_phase_start;
+    std::chrono::steady_clock::time_point      m_step_start;
+};
+
+} // namespace
 
 void start_ping_test()
 {
@@ -1069,14 +1136,20 @@ GUI_App::GUI_App()
     , m_download_manager(&DownloadManager::getInstance())
 	, m_other_instance_message_handler(std::make_unique<OtherInstanceMessageHandler>())
 {
+    StartupProfiler profiler("GUI_App::GUI_App");
+
 	//app config initializes early becasuse it is used in instance checking in Snapmaker_Orca.cpp
     this->init_app_config();
+    profiler.mark("init_app_config");
     this->init_download_path();
+    profiler.mark("init_download_path");
 #if wxUSE_WEBVIEW_EDGE
     this->init_webview_runtime();
+    profiler.mark("init_webview_runtime");
 #endif
 
     reset_to_active();
+    profiler.mark("reset_to_active");
 
     // test
     m_page_http_server.setPort(PAGE_HTTP_PORT);
@@ -1084,8 +1157,10 @@ GUI_App::GUI_App()
     m_page_http_server.start();
     BOOST_LOG_TRIVIAL(info) << "[Flutter] Version:"<<common::get_flutter_version();
     BOOST_LOG_TRIVIAL(info) << "[Profile] Version:" << common::get_profile_version();
-    flush_logs();
+    profiler.mark("m_page_http_server.start");
     m_fltviews.set_app(this);
+    profiler.mark("m_fltviews.set_app");
+    flush_logs();
 }
 
 void GUI_App::shutdown(bool isRecreate)
@@ -2069,11 +2144,14 @@ bool GUI_App::check_older_app_config(Semver current_version, bool backup)
 }
 
 void GUI_App::copy_web_resources() {
+    StartupProfiler profiler("GUI_App::copy_web_resources");
+
     auto data_web_path = boost::filesystem::path(data_dir()) / "web";
     if (!boost::filesystem::exists(data_web_path / "flutter_web")) {
         auto source_path = boost::filesystem::path(resources_dir()) / "web" / "flutter_web";
         auto target_path = data_web_path / "flutter_web";
         copy_directory_recursively(source_path, target_path);
+        profiler.mark("copy flutter_web (missing target)");
     } else {
         auto source_version_file = boost::filesystem::path(resources_dir()) / "web" / "flutter_web" / "version.json";
         auto target_version_file = data_web_path / "flutter_web" / "version.json";
@@ -2089,10 +2167,13 @@ void GUI_App::copy_web_resources() {
                 auto source_path = boost::filesystem::path(resources_dir()) / "web" / "flutter_web";
                 auto target_path = data_web_path / "flutter_web";
                 copy_directory_recursively(source_path, target_path);
+                profiler.mark("copy flutter_web (version upgrade)");
+            } else {
+                profiler.note("flutter_web already up to date");
             }
         }
         catch (std::exception& e) {
-
+            profiler.note(std::string("version check failed: ") + e.what());
         }
     }
 }
@@ -2278,6 +2359,8 @@ class wxBoostLog : public wxLog
 
 bool GUI_App::on_init_inner()
 {
+    StartupProfiler profiler("GUI_App::on_init_inner");
+
     wxLog::SetActiveTarget(new wxBoostLog());
 #if BBL_RELEASE_TO_PUBLIC
     wxLog::SetLogLevel(wxLOG_Message);
@@ -2290,6 +2373,7 @@ bool GUI_App::on_init_inner()
 #ifdef NDEBUG
     wxImage::SetDefaultLoadFlags(0); // ignore waring in release build
 #endif
+    profiler.mark("wx init/log/image handlers");
 
 #if defined(_WIN32) && ! defined(_WIN64)
     // BBS: remove 32bit build prompt
@@ -2416,6 +2500,7 @@ bool GUI_App::on_init_inner()
     init_label_colours();
     init_fonts();
     wxGetApp().Update_dark_mode_flag();
+    profiler.mark("language/theme/fonts");
 
 
 #ifdef _MSW_DARK_MODE
@@ -2453,6 +2538,7 @@ bool GUI_App::on_init_inner()
             remove_old_networking_plugins();
         }
     }
+    profiler.mark("version/network plugin cleanup");
 
     if(app_config->get("version") != SLIC3R_VERSION) {
         app_config->set("version", SLIC3R_VERSION);
@@ -2487,11 +2573,14 @@ bool GUI_App::on_init_inner()
     // just checking for existence of Slic3r::data_dir is not enough : it may be an empty directory
     // supplied as argument to --datadir; in that case we should still run the wizard
     preset_bundle->setup_directories();
+    profiler.mark("preset_bundle->setup_directories");
 
     copy_web_resources();
+    profiler.mark("copy_web_resources");
 
     if (m_init_app_config_from_older)
         copy_older_config();
+    profiler.mark("copy_older_config_if_needed");
 
     if (is_editor()) {
 #ifdef __WXMSW__
@@ -2614,6 +2703,7 @@ bool GUI_App::on_init_inner()
     preset_bundle->set_default_suppressed(true);
 
     preset_bundle->backup_user_folder();
+    profiler.mark("preset_bundle->backup_user_folder");
 
     Bind(EVT_SHOW_IP_DIALOG, &GUI_App::show_ip_address_enter_dialog_handler, this);
 
@@ -2638,7 +2728,9 @@ bool GUI_App::on_init_inner()
         }
     } */
     copy_network_if_available();
+    profiler.mark("copy_network_if_available");
     on_init_network();
+    profiler.mark("on_init_network");
 
     if (m_agent && m_agent->is_user_login()) {
         enable_user_preset_folder(true);
@@ -2658,6 +2750,7 @@ bool GUI_App::on_init_inner()
             show_error(nullptr, ex.what());
         }
     //}
+    profiler.mark("preset_bundle->load_presets");
 
 #ifdef WIN32
 #if !wxVERSION_EQUAL_OR_GREATER_THAN(3,1,3)
@@ -2671,15 +2764,13 @@ bool GUI_App::on_init_inner()
 
     BOOST_LOG_TRIVIAL(info) << "create the main window";
     mainframe = new MainFrame();
-    if (!m_updateDialog)
-    {
-        m_updateDialog = new UpdateVersionDialog(mainframe);
-        m_updateDialog->Hide();
-        m_updateDialog->Bind(EVT_DOWN_URL_PACK, [this](wxCommandEvent& event) {
-            auto downloadUlr = m_updateDialog->getUrl();
-            wxLaunchDefaultBrowser(downloadUlr);
-        });
-    }
+    m_updateDialog = new UpdateVersionDialog(mainframe);
+    m_updateDialog->Hide();
+    m_updateDialog->Bind(EVT_DOWN_URL_PACK, [this](wxCommandEvent& event) {
+        auto downloadUlr = m_updateDialog->getUrl();
+        wxLaunchDefaultBrowser(downloadUlr);
+    });
+    profiler.mark("mainframe construction");
 
     // hide settings tabs after first Layout
     if (is_editor()) {
@@ -2705,6 +2796,7 @@ bool GUI_App::on_init_inner()
     }
     else
         load_current_presets();
+    profiler.mark("load_current_presets");
 
     if (plater_ != nullptr) {
         plater_->reset_project_dirty_initial_presets();
@@ -2717,6 +2809,7 @@ bool GUI_App::on_init_inner()
 #endif
     mainframe->Show(true);
     BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
+    profiler.mark("mainframe->Show");
 
     obj_list()->set_min_height();
 
@@ -2792,6 +2885,8 @@ bool GUI_App::on_init_inner()
                        "The Snapmaker Orca configuration file may be corrupted and cannot be parsed.\nSnapmaker Orca has attempted to recreate the "
                        "configuration file.\nPlease note, application settings will be lost, but printer profiles will not be affected."));
     }
+
+    profiler.mark("on_init_inner return");
 
     return true;
 }
@@ -2938,16 +3033,21 @@ void GUI_App::copy_network_if_available()
 
 bool GUI_App::on_init_network(bool try_backup)
 {
+    StartupProfiler profiler("GUI_App::on_init_network");
+
     bool create_network_agent = false;
     auto should_load_networking_plugin = app_config->get_bool("installed_networking");
     if(!should_load_networking_plugin) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Don't load plugin as installed_networking is false";
+        profiler.note("installed_networking=false, plugin load skipped");
     } else {
     int load_agent_dll = Slic3r::NetworkAgent::initialize_network_module();
+    profiler.mark("NetworkAgent::initialize_network_module");
 __retry:
     if (!load_agent_dll) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": on_init_network, load dll ok";
         if (check_networking_version()) {
+            profiler.mark("check_networking_version");
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": on_init_network, compatibility version";
             auto bambu_source = Slic3r::NetworkAgent::get_bambu_source_entry();
             if (!bambu_source) {
@@ -2964,6 +3064,7 @@ __retry:
                 int result = Slic3r::NetworkAgent::unload_network_module();
                 BOOST_LOG_TRIVIAL(info) << "on_init_network, version mismatch, unload_network_module, result = " << result;
                 load_agent_dll = Slic3r::NetworkAgent::initialize_network_module(true);
+                profiler.mark("initialize_network_module(backup)");
                 try_backup = false;
                 goto __retry;
             }
@@ -3030,6 +3131,7 @@ __retry:
             std::string country_code = app_config->get_country_code();
             m_agent->set_country_code(country_code);
             m_agent->start();
+            profiler.mark("m_agent->start");
         }
     }
     else {
@@ -3042,6 +3144,8 @@ __retry:
         if (!m_user_manager)
             m_user_manager = new Slic3r::UserManager();
     }
+
+    profiler.note(std::string("create_network_agent=") + (create_network_agent ? "true" : "false"));
 
     return true;
 }
